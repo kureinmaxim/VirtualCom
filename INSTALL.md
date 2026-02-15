@@ -1,205 +1,214 @@
-# INSTALL.md — установка и сборка VirtualCom (Windows)
+# VirtualCom Installation and Build Guide
 
-Этот документ описывает полный цикл:
-
-1. локальный запуск `vicom.py`,
-2. устранение ошибки `pip is not recognized`,
-3. сборка `exe` через PyInstaller,
-4. сборка установщика через Inno Setup.
+This document describes how to install, run, and build VirtualCom for **Windows** and **macOS**.
 
 ---
 
-## 1) Требования
+## Versioning (Important)
 
-- Windows 10/11
-- Python 3.13+ (желательно установить с опцией **Add Python to PATH**)
-- Inno Setup 6 (для создания инсталлятора)
+Single source of truth:
+- `pyproject.toml` (`[project].version` + `[tool.virtualcom].release_date`)
 
-Проект:
-- основной файл: `vicom.py`
-- зависимости: `requirements.txt`
-- скрипт сборки: `build_installer.bat`
-- скрипт Inno Setup: `installer.iss`
+Before any installer build (Windows/macOS), check version sync.
 
----
+macOS/Linux:
 
-## 2) Быстрый запуск проекта из исходников
+```bash
+python3 scripts/update_version.py status | cat
+```
 
-Откройте PowerShell и выполните:
+Windows:
 
 ```powershell
-cd C:\Project\ProjectPython\VirtualCom
-python -m venv venv
-venv\Scripts\python.exe -m pip install --upgrade pip
-venv\Scripts\python.exe -m pip install -r requirements.txt
-venv\Scripts\python.exe vicom.py
+python scripts\update_version.py status
+```
+
+If status contains `[MISMATCH]`, run sync first.
+
+macOS/Linux:
+
+```bash
+python3 scripts/update_version.py sync | cat
+```
+
+Windows:
+
+```powershell
+python scripts\update_version.py sync
 ```
 
 ---
 
-## 3) Если `pip` не распознается
+## Quick Start (Automated Build)
 
-Симптом:
+### Windows
 
-```text
-pip: The term 'pip' is not recognized ...
-```
-
-Причина: `pip` не добавлен в PATH (или активировано другое окружение).
-
-Решение: всегда ставьте пакеты через интерпретатор Python:
+Run:
 
 ```powershell
-python -m pip install --upgrade pip
-python -m pip install -r requirements.txt
-```
-
-Если в проекте используется виртуальное окружение, предпочтительно:
-
-```powershell
-venv\Scripts\python.exe -m pip install -r requirements.txt
-```
-
----
-
-## 4) Полная сборка EXE + установщика (рекомендуемый способ)
-
-Самый простой путь — запустить готовый скрипт:
-
-```powershell
-cd C:\Project\ProjectPython\VirtualCom
 .\build_installer.bat
 ```
 
-Скрипт выполняет автоматически:
+This will:
+1. Validate version sync (fails on mismatch).
+2. Create virtual environment (`venv`).
+3. Install requirements and PyInstaller.
+4. Build executable (`dist\VirtualCom.exe`).
+5. Build installer (`output\VirtualCom_Setup_<version>.exe`) via Inno Setup.
 
-1. проверку Python,
-2. создание `venv` (если отсутствует),
-3. установку `requirements.txt` и `pyinstaller`,
-4. сборку `dist\VirtualCom.exe`,
-5. запуск `ISCC.exe` и сборку инсталлятора.
+### macOS
 
-Результат:
+Run:
 
-- `dist\VirtualCom.exe` — собранное приложение
-- `output\VirtualCom_Setup_1.0.0.exe` — готовый инсталлятор
+```bash
+bash build_installer_mac.sh | cat
+```
+
+This will:
+1. Create virtual environment (`venv_mac`).
+2. Install requirements and PyInstaller.
+3. Build executable (`dist_mac/VirtualCom`) and wrap into `VirtualCom.app`.
+4. Create drag-and-drop DMG (`VirtualCom_Installer.dmg`) with `Applications` shortcut.
 
 ---
 
-## 5) Ручная сборка (если нужно контролировать каждый шаг)
+## Prerequisites
 
-### 5.1 Собрать EXE через PyInstaller
+### Common
+- Python 3.12+ available in PATH.
+
+### Windows
+- Inno Setup 6 (`ISCC.exe`) for `.exe` installer packaging.
+
+### macOS
+- No extra tools required (uses built-in `hdiutil`, `sips`, `iconutil`, `osascript`).
+
+---
+
+## Run From Source (Development)
+
+### Windows
 
 ```powershell
-cd C:\Project\ProjectPython\VirtualCom
 python -m venv venv
-venv\Scripts\python.exe -m pip install --upgrade pip
-venv\Scripts\python.exe -m pip install -r requirements.txt pyinstaller
-venv\Scripts\python.exe -m PyInstaller --clean --noconfirm --onefile --console --name VirtualCom vicom.py
+venv\Scripts\python -m pip install -r requirements.txt
+venv\Scripts\python vicom.py
 ```
 
-Проверьте, что появился файл:
+### macOS
 
-- `dist\VirtualCom.exe`
-
-### 5.2 Собрать инсталлятор через Inno Setup
-
-Вариант A: через GUI Inno Setup
-- открыть `installer.iss`
-- нажать **Compile**
-
-Вариант B: через командную строку:
-
-```powershell
-"C:\Program Files (x86)\Inno Setup 6\ISCC.exe" "C:\Project\ProjectPython\VirtualCom\installer.iss"
+```bash
+python3 -m venv venv
+source venv/bin/activate
+pip install -r requirements.txt
+python3 vicom.py
 ```
 
-Если Inno Setup установлен в другой каталог, укажите фактический путь к `ISCC.exe`.
-
 ---
 
-## 6) Проверка результата
+## Manual Build (If Needed)
 
-После успешной сборки должно быть:
+### 1) Setup Environment
 
-- `dist\VirtualCom.exe`
-- `output\VirtualCom_Setup_1.0.0.exe`
-
-Проверьте установщик:
-
-1. запустить `output\VirtualCom_Setup_1.0.0.exe`,
-2. установить программу,
-3. запустить ярлык `VirtualCom`,
-4. убедиться, что приложение открывается и видит COM-порты.
-
----
-
-## 7) Типовые ошибки и решения
-
-### Ошибка: `Source file "...dist\VirtualCom.exe" does not exist`
-
-Причина: EXE ещё не собран.
-
-Решение:
-
-1. сначала собрать через PyInstaller (`build_installer.bat` или шаг 5.1),
-2. затем компилировать `installer.iss`.
-
----
-
-### Ошибка: `pip is not recognized`
-
-Решение: использовать `python -m pip ...` или `venv\Scripts\python.exe -m pip ...`.
-
----
-
-### Ошибка: `ISCC.exe not found`
-
-Причина: Inno Setup не установлен или установлен не по стандартному пути.
-
-Решение:
-
-1. установить Inno Setup 6,
-2. проверить наличие `ISCC.exe`,
-3. при ручном запуске указывать корректный путь.
-
----
-
-### Ошибка PowerShell при активации venv (`Activate.ps1` blocked)
-
-Если нужно именно активировать окружение, временно разрешите выполнение:
+Windows:
 
 ```powershell
-Set-ExecutionPolicy -Scope Process -ExecutionPolicy Bypass
-.\venv\Scripts\Activate.ps1
+python -m venv venv
+venv\Scripts\python -m pip install -r requirements.txt pyinstaller
 ```
 
-Но активация не обязательна: можно всегда запускать через `venv\Scripts\python.exe`.
+macOS:
+
+```bash
+python3 -m venv venv
+source venv/bin/activate
+pip install -r requirements.txt pyinstaller
+```
+
+### 2) Build Executable (PyInstaller)
+
+Windows:
+
+```powershell
+pyinstaller --clean --noconfirm --onefile --console --name VirtualCom vicom.py
+```
+
+Result: `dist\VirtualCom.exe`
+
+macOS:
+
+```bash
+pyinstaller --clean --noconfirm --onefile --console --name VirtualCom vicom.py
+```
+
+Result: `dist/VirtualCom`
+
+### 3) Package Installer
+
+Windows (Inno Setup):
+
+```powershell
+"C:\Program Files (x86)\Inno Setup 6\ISCC.exe" "installer.iss"
+```
+
+Result: `output\VirtualCom_Setup_<version>.exe`
+
+macOS (recommended script):
+
+```bash
+bash build_installer_mac.sh | cat
+```
+
+Result: `VirtualCom_Installer.dmg`
 
 ---
 
-## 8) Рекомендуемый рабочий сценарий
+## Troubleshooting (Windows)
 
-Для ежедневной работы:
+### "pip is not recognized"
+
+Use:
 
 ```powershell
-cd C:\Project\ProjectPython\VirtualCom
-venv\Scripts\python.exe vicom.py
+python -m pip install ...
 ```
 
-Для релиза:
+or inside venv:
 
 ```powershell
-cd C:\Project\ProjectPython\VirtualCom
+venv\Scripts\python -m pip install ...
+```
+
+### "ISCC.exe not found"
+
+Install Inno Setup 6 or update path in `build_installer.bat`.
+
+### "Version files are out of sync"
+
+Run:
+
+```powershell
+python scripts\update_version.py sync
 .\build_installer.bat
 ```
 
+### PowerShell execution policy blocks activation
+
+Use direct interpreter call:
+
+```powershell
+.\venv\Scripts\python.exe vicom.py
+```
+
 ---
 
-## 9) Что лежит в проекте для установки
+## Build-Related Files
 
-- `requirements.txt` — зависимости Python
-- `build_installer.bat` — автоматическая сборка релиза
-- `installer.iss` — конфигурация Inno Setup
-- `INSTALL.md` — этот документ
-
+- `vicom.py` - Main application script.
+- `requirements.txt` - Python dependencies.
+- `pyproject.toml` - Source of truth for version/date.
+- `scripts/update_version.py` - Version sync CLI.
+- `version_info.py` - Runtime version data (derived).
+- `build_installer.bat` - Windows build script.
+- `installer.iss` - Windows Inno Setup config.
+- `build_installer_mac.sh` - macOS build/DMG script.

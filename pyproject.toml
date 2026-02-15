@@ -1,0 +1,7 @@
+[project]
+name = "virtualcom"
+version = "1.1.1"
+requires-python = ">=3.12"
+
+[tool.virtualcom]
+release_date = "15.02.2026"

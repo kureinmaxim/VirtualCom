@@ -1,6 +1,6 @@
 ; Inno Setup script for VirtualCom
 #define MyAppName "VirtualCom"
-#define MyAppVersion "1.1.0"
+#define MyAppVersion "1.1.1"
 #define MyAppPublisher "VirtualCom Team"
 #define MyAppURL "https://example.local/virtualcom"
 #if FileExists("dist\VirtualCom.exe")
@@ -31,6 +31,7 @@ SolidCompression=yes
 WizardStyle=modern
 ArchitecturesInstallIn64BitMode=x64compatible
 PrivilegesRequired=admin
+SetupIconFile=assets\icons\virtualcom.ico
 
 [Languages]
 Name: "russian"; MessagesFile: "compiler:Languages\Russian.isl"

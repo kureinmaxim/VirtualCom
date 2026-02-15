@@ -4,15 +4,49 @@ import sys
 import threading
 import time
 import os # Для очистки экрана
+import json
+import subprocess
+from pathlib import Path
+from version_info import __release_date__, __version__
 
-# Импорт msvcrt только для Windows
+# Кроссплатформенный импорт модулей для работы с клавиатурой
 if os.name == 'nt':
     import msvcrt
+    getch = msvcrt.getch
+    kbhit = msvcrt.kbhit
 else:
-    # Для других ОС пока не реализовано
-    msvcrt = None
+    import sys
+    import tty
+    import termios
+    import select
+    
+    class UnixGetch:
+        """Класс для реализации getch() на Unix-подобных системах."""
+        def __call__(self):
+            fd = sys.stdin.fileno()
+            old_settings = termios.tcgetattr(fd)
+            try:
+                tty.setraw(sys.stdin.fileno())
+                ch = sys.stdin.read(1)
+            finally:
+                termios.tcsetattr(fd, termios.TCSADRAIN, old_settings)
+            
+            # Обработка Ctrl+C (ETX)
+            if ch == '\x03':
+                raise KeyboardInterrupt
+            
+            return ch.encode('utf-8')
+
+    def unix_kbhit():
+        """Реализация kbhit() для Unix."""
+        dr, dw, de = select.select([sys.stdin], [], [], 0)
+        return dr != []
+
+    getch = UnixGetch()
+    kbhit = unix_kbhit
 
 # Значения по умолчанию
+
 DEFAULT_SETTINGS = {
     "baudrate": 38400,
     "bytesize": serial.EIGHTBITS,
@@ -21,6 +55,259 @@ DEFAULT_SETTINGS = {
 }
 
 POLYNOMIAL = 0xA001  # Стандартный полином для CRC16-MODBUS
+HISTORY_KEYS = ("text", "hex", "hex_crc")
+RUNTIME_COMMANDS = ("help", "init", "doctor", "history", "/help", "/init", "/doctor", "/history")
+RUNTIME_COMMAND_HELP = {
+    "help": "Справка по служебным командам",
+    "init": "Текущие параметры порта/сессии",
+    "doctor": "Диагностика соединения",
+    "history": "История команд текущего режима",
+}
+
+if os.name != 'nt':
+    try:
+        import readline  # type: ignore
+        READLINE_AVAILABLE = True
+    except Exception:
+        READLINE_AVAILABLE = False
+else:
+    READLINE_AVAILABLE = False
+
+
+def get_user_data_dir() -> Path:
+    """Возвращает каталог данных приложения, переживающий переустановку."""
+    if os.name == 'nt':
+        appdata = os.getenv("APPDATA")
+        base = Path(appdata) if appdata else Path.home() / "AppData" / "Roaming"
+        return base / "VirtualCom"
+    if sys.platform == "darwin":
+        return Path.home() / "Library" / "Application Support" / "VirtualCom"
+    return Path.home() / ".local" / "share" / "VirtualCom"
+
+
+APP_DATA_DIR = get_user_data_dir()
+HISTORY_FILE = APP_DATA_DIR / "command_history.json"
+
+
+def _empty_history() -> dict[str, list[str]]:
+    return {key: [] for key in HISTORY_KEYS}
+
+
+def deduplicate_list_keep_last(items: list[str]) -> list[str]:
+    """Удаляет дубликаты, оставляя последнее вхождение."""
+    seen: set[str] = set()
+    result_rev: list[str] = []
+    for item in reversed(items):
+        if item not in seen:
+            seen.add(item)
+            result_rev.append(item)
+    return list(reversed(result_rev))
+
+
+def load_command_history() -> dict[str, list[str]]:
+    """Загружает историю команд из JSON-файла."""
+    APP_DATA_DIR.mkdir(parents=True, exist_ok=True)
+    if not HISTORY_FILE.exists():
+        return _empty_history()
+    try:
+        data = json.loads(HISTORY_FILE.read_text(encoding="utf-8"))
+        normalized = _empty_history()
+        if isinstance(data, dict):
+            for key in HISTORY_KEYS:
+                value = data.get(key, [])
+                if isinstance(value, list):
+                    cleaned = [str(v) for v in value if str(v).strip()]
+                    normalized[key] = deduplicate_list_keep_last(cleaned)
+        return normalized
+    except Exception:
+        # Поврежденный файл не должен ломать запуск.
+        return _empty_history()
+
+
+def save_command_history():
+    """Сохраняет историю команд в JSON-файл."""
+    APP_DATA_DIR.mkdir(parents=True, exist_ok=True)
+    HISTORY_FILE.write_text(
+        json.dumps(COMMAND_HISTORY, ensure_ascii=False, indent=2),
+        encoding="utf-8",
+    )
+
+
+def add_command_to_history(history_key: str, command: str):
+    """Добавляет команду в историю и сохраняет ее на диск."""
+    value = command.strip()
+    if not value or history_key not in COMMAND_HISTORY:
+        return
+    # Сразу поддерживаем историю без дублей:
+    # одинаковая команда переносится в конец как "последняя использованная".
+    COMMAND_HISTORY[history_key] = [cmd for cmd in COMMAND_HISTORY[history_key] if cmd != value]
+    COMMAND_HISTORY[history_key].append(value)
+    save_command_history()
+
+
+def apply_readline_history(history_key: str):
+    """Подгружает историю выбранного раздела в readline (macOS/Linux)."""
+    if not READLINE_AVAILABLE:
+        return
+    readline.clear_history()
+    for item in COMMAND_HISTORY.get(history_key, []):
+        readline.add_history(item)
+
+
+def make_readline_completer(history_key: str | None):
+    """Tab-completion для служебных команд и истории текущего режима."""
+    mode_items = COMMAND_HISTORY.get(history_key, []) if history_key in HISTORY_KEYS else []
+    candidates = sorted(set((*RUNTIME_COMMANDS, *mode_items)), key=str.lower)
+
+    def _completer(text, state):
+        lowered = text.lower()
+        matches = [item for item in candidates if item.lower().startswith(lowered)]
+        return matches[state] if state < len(matches) else None
+
+    return _completer
+
+
+def make_readline_display_hook(prompt: str):
+    """Красиво выводит варианты автодополнения как в терминале."""
+    def _display(substitution, matches, longest_match_length):
+        print()
+        for item in matches:
+            key = item.lstrip("/")
+            hint = RUNTIME_COMMAND_HELP.get(key)
+            if hint:
+                print(f"  {item:<12} - {hint}")
+            else:
+                print(f"  {item}")
+        try:
+            current = readline.get_line_buffer()
+        except Exception:
+            current = substitution
+        print(f"{prompt}{current}", end="", flush=True)
+
+    return _display
+
+
+def history_label(history_key: str) -> str:
+    labels = {"text": "Текст", "hex": "HEX", "hex_crc": "HEX+CRC"}
+    return labels.get(history_key, history_key)
+
+
+def flatten_history(mode_key: str | None) -> list[tuple[str, str]]:
+    if mode_key in HISTORY_KEYS:
+        return [(mode_key, cmd) for cmd in COMMAND_HISTORY[mode_key]]
+    result: list[tuple[str, str]] = []
+    for key in HISTORY_KEYS:
+        result.extend((key, cmd) for cmd in COMMAND_HISTORY[key])
+    return result
+
+
+def deduplicate_history(mode_key: str | None):
+    """Удаляет дубликаты, оставляя последнее вхождение команды."""
+    keys = [mode_key] if mode_key in HISTORY_KEYS else list(HISTORY_KEYS)
+    for key in keys:
+        seen: set[str] = set()
+        dedup_reversed: list[str] = []
+        for cmd in reversed(COMMAND_HISTORY[key]):
+            if cmd not in seen:
+                seen.add(cmd)
+                dedup_reversed.append(cmd)
+        COMMAND_HISTORY[key] = list(reversed(dedup_reversed))
+    save_command_history()
+
+
+def clear_history(mode_key: str | None):
+    keys = [mode_key] if mode_key in HISTORY_KEYS else list(HISTORY_KEYS)
+    for key in keys:
+        COMMAND_HISTORY[key] = []
+    save_command_history()
+
+
+def show_history_entries(mode_key: str | None):
+    entries = flatten_history(mode_key)
+    if not entries:
+        print("\n📭 История пуста.")
+        return
+    print("\n=== 🕘 История команд ===")
+    for i, (key, cmd) in enumerate(entries, start=1):
+        print(f"  {i}. [{history_label(key)}] {cmd}")
+
+
+def manage_command_history():
+    """Упрощенное меню управления историей (без вложенных шагов)."""
+    while True:
+        entries = flatten_history(None)
+        print(f"\n📂 Файл истории: {HISTORY_FILE}")
+        print(f"Всего записей: {len(entries)}")
+        action = choose_option(
+            "Управление историей:",
+            [
+                "Показать историю",
+                "Удалить запись",
+                "Удалить дубликаты (вся история)",
+                "Очистить всю историю",
+                "Назад",
+            ],
+        )
+
+        if action == "Назад":
+            return
+
+        if action == "Показать историю":
+            show_history_entries(None)
+            continue
+
+        if action == "Удалить запись":
+            if not entries:
+                print("\n📭 История пуста.")
+                continue
+            show_history_entries(None)
+            try:
+                idx = int(input("\nВведите номер записи для удаления: ").strip())
+            except ValueError:
+                print("⚠️ Ошибка: введите число.")
+                continue
+            if idx < 1 or idx > len(entries):
+                print("⚠️ Ошибка: номер вне диапазона.")
+                continue
+            key, value = entries[idx - 1]
+            try:
+                COMMAND_HISTORY[key].remove(value)
+            except ValueError:
+                print("⚠️ Не удалось удалить запись (история изменилась).")
+                continue
+            save_command_history()
+            print("✅ Запись удалена.")
+            continue
+
+        if action == "Удалить дубликаты (вся история)":
+            deduplicate_history(None)
+            print("✅ Дубликаты удалены.")
+            continue
+
+        if action == "Очистить всю историю":
+            confirm = input("Подтвердите очистку (y/n): ").strip().lower()
+            if confirm == "y":
+                clear_history(None)
+                print("✅ История очищена.")
+            else:
+                print("ℹ️ Очистка отменена.")
+
+
+COMMAND_HISTORY = load_command_history()
+
+
+def safe_close_serial(ser, port_name: str | None = None):
+    """Безопасно закрывает serial-порт без падения на повторном close()."""
+    if not ser:
+        return
+    try:
+        if ser.is_open:
+            ser.close()
+            if port_name:
+                print(f"\n🔌 Порт {port_name} закрыт.")
+    except (serial.SerialException, OSError):
+        # Уже закрыт/дескриптор недоступен — для graceful shutdown это нормально.
+        pass
 
 def calculate_crc16(data: bytes) -> int:
     """
@@ -55,7 +342,7 @@ def receive_data(ser, port_name, processing_event):
 
             # Прием и обработка данных (только если is_processing_allowed == True и есть данные)
             request = ser.read(ser.in_waiting)
-            print(f"\n{port_name} 📥 Получен запрос HEX: {' '.join(f'{b:02X}' for b in request)}")
+            print(f"\n{port_name} 📥 Получены данные HEX: {' '.join(f'{b:02X}' for b in request)}")
             try:
                 # Попытка декодировать как ASCII, заменяя непечатаемые символы
                 ascii_representation = request.decode('ascii', errors='replace')
@@ -66,15 +353,24 @@ def receive_data(ser, port_name, processing_event):
             response = process_request(request)
             if response:
                 ser.write(response)
-                print(f"📤 Отправлен ответ: {' '.join(f'{b:02X}' for b in response)}")
-            # Выводим приглашение снова после получения данных (без \n)
-            print("Меню (Esc) или Выход (Ctrl+C): ", end='', flush=True)
+                print(f"📤 Отправлен автоответ: {' '.join(f'{b:02X}' for b in response)}")
+            # Не печатаем меню-приглашение из фонового потока:
+            # это ломает UX в режимах отправки (HEX/TEXT), создавая ложное
+            # впечатление, что приложение вышло в главное меню.
 
         except serial.SerialException as serial_err:
             # Обработка ошибок, связанных с портом (например, отключение устройства)
             print(f"\n⚠️ Ошибка порта в потоке приема: {serial_err}")
             break # Выход из цикла потока
+        except OSError as e:
+            # При закрытии порта в другом потоке на Unix/macOS возможен EBADF.
+            if getattr(e, "errno", None) == 9:
+                break
+            print(f"\n⚠️ Ошибка ОС при приеме данных: {e}")
+            time.sleep(0.1)
         except Exception as e:
+            if isinstance(e, OSError) and getattr(e, "errno", None) == 9:
+                break
             print(f"\n⚠️ Ошибка при приеме данных: {e}")
             # Можно продолжить или выйти в зависимости от типа ошибки
             time.sleep(0.1)
@@ -85,13 +381,15 @@ def send_hex_data(ser, hex_string: str):
         hex_string = hex_string.replace(" ", "")
         if not all(c in '0123456789ABCDEFabcdef' for c in hex_string):
             print("❌ Ошибка: неверный формат HEX данных")
-            return
+            return False
         
         data = bytes.fromhex(hex_string)
         ser.write(data)
         print(f"📤 Отправлено (HEX): {' '.join(f'{b:02X}' for b in data)}")
+        return True
     except ValueError:
         print("❌ Ошибка: неверный формат HEX данных")
+        return False
 
 def send_hex_data_with_crc(ser, hex_string: str):
     """Отправка HEX данных в порт с добавлением CRC16"""
@@ -99,7 +397,7 @@ def send_hex_data_with_crc(ser, hex_string: str):
         hex_string = hex_string.replace(" ", "")
         if not all(c in '0123456789ABCDEFabcdef' for c in hex_string):
             print("❌ Ошибка: неверный формат HEX данных")
-            return
+            return False
         
         data = bytes.fromhex(hex_string)
         crc = calculate_crc16(data)
@@ -109,15 +407,18 @@ def send_hex_data_with_crc(ser, hex_string: str):
         
         ser.write(final_data)
         print(f"📤 Отправлено (HEX+CRC): {' '.join(f'{b:02X}' for b in data)} | CRC: {crc & 0xFF:02X} {(crc >> 8) & 0xFF:02X}")
+        return True
         
     except ValueError:
         print("❌ Ошибка: неверный формат HEX данных")
+        return False
 
 def send_text_message(ser, message: str):
     """Отправка текстового сообщения в порт"""
     data = message.encode('utf-8')
     ser.write(data)
     print(f"📤 Отправлено (текст): {message}")
+    return True
 
 def show_menu(status_message: str | None = None):
     """Отображение меню команд и опционального статусного сообщения."""
@@ -129,9 +430,10 @@ def show_menu(status_message: str | None = None):
     print("5. ▶️  Продолжить прием команд")
     print("6. Очистить экран")
     print("7. Выход")
+    print("8. 🕘 История команд")
     if status_message:
         print(f"\n{status_message}") 
-    print("Выберите действие (1-7), Меню (Esc) или Выход (Ctrl+C): ", end='', flush=True)
+    print("Выберите действие (1-8), Меню (Esc) или Выход (Ctrl+C): ", end='', flush=True)
 
 def list_available_ports():
     """Возвращает список доступных COM-портов и выводит их на экран, отсортированных по номеру."""
@@ -139,6 +441,17 @@ def list_available_ports():
     if not ports:
         print("❌ Нет доступных последовательных портов!")
         return []
+
+    # На macOS скрываем системные pseudo-порты, которые часто путают
+    # и не используются как обычные внешние последовательные устройства.
+    if os.name != 'nt':
+        excluded_keywords = ("Bluetooth-Incoming-Port", "debug-console")
+        filtered_ports = [
+            p for p in ports
+            if not any(keyword in p.device for keyword in excluded_keywords)
+        ]
+        if filtered_ports:
+            ports = filtered_ports
 
     # Функция для извлечения номера из имени порта (например, COM10 -> 10)
     def extract_com_number(port_info):
@@ -153,6 +466,7 @@ def list_available_ports():
     ports.sort(key=extract_com_number)
 
     print("\n🔌 Доступные порты (отсортировано):")
+    print("  0. ➕ Открыть еще одно приложение (дубликат)")
     for i, port in enumerate(ports, start=1):
         print(f"  {i}. {port.device}")
 
@@ -166,12 +480,48 @@ def select_port():
 
     while True:
         try:
-            selected_index = int(input("\nВведите номер порта: ")) - 1
+            selected_raw = input("\nВведите номер порта (или 0 для дубликата): ").strip()
+            if selected_raw == "0":
+                launch_duplicate_instance()
+                continue
+            selected_index = int(selected_raw) - 1
             if 0 <= selected_index < len(ports):
                 return ports[selected_index].device
             print("⚠️ Ошибка: введите корректный номер порта!")
         except ValueError:
             print("⚠️ Ошибка: введите число!")
+
+
+def launch_duplicate_instance():
+    """Запускает еще один экземпляр приложения."""
+    try:
+        is_frozen = getattr(sys, "frozen", False)
+
+        # Запуск собранного приложения (PyInstaller)
+        if is_frozen:
+            if sys.platform == "darwin":
+                exe_path = Path(sys.executable).resolve()
+                # .../VirtualCom.app/Contents/Resources/VirtualCom_bin -> .../VirtualCom.app
+                app_bundle = exe_path.parents[2]
+                if app_bundle.suffix == ".app" and app_bundle.exists():
+                    subprocess.Popen(["open", "-n", str(app_bundle)])
+                else:
+                    subprocess.Popen([str(exe_path)])
+            elif os.name == "nt":
+                creation_flags = (
+                    getattr(subprocess, "DETACHED_PROCESS", 0)
+                    | getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0)
+                )
+                subprocess.Popen([sys.executable], creationflags=creation_flags)
+            else:
+                subprocess.Popen([sys.executable])
+        else:
+            # Запуск из исходников
+            subprocess.Popen([sys.executable, str(Path(__file__).resolve())])
+
+        print("✅ Запущен новый экземпляр приложения.")
+    except Exception as e:
+        print(f"❌ Не удалось запустить дубликат: {e}")
 
 def is_port_currently_available(port_name: str) -> bool:
     """Проверяет, что порт все еще присутствует в актуальном списке устройств."""
@@ -200,81 +550,47 @@ def choose_configuration_mode():
     print("1. Ручная настройка параметров")
     print("2. Использовать настройки по умолчанию")
     print("   (38400 бод, 8 бит, без паритета, 1 стоп-бит)")
-    print("\nВыберите режим настройки (1 или 2): ", end='', flush=True)
 
+    print("\nВыберите режим настройки (1 или 2): ", end='', flush=True)
     while True:
-        if msvcrt and msvcrt.kbhit(): # Используем msvcrt, если доступен
-            key = msvcrt.getch()
-            if key == b'1':
-                print("1") # Отображаем выбор
-                return None # Ручная настройка
-            elif key == b'2':
-                print("2") # Отображаем выбор
-                return DEFAULT_SETTINGS # Настройки по умолчанию
-            elif key == b'\x03': # Ctrl+C
-                raise KeyboardInterrupt
-            # Игнорируем другие клавиши
-        elif not msvcrt: # Если msvcrt недоступен, используем input
-             # Перемещаем сюда запрос input из старой версии
-            choice = input().strip()
-            if choice == '1':
-                return None
-            elif choice == '2':
-                return DEFAULT_SETTINGS
-            else:
-                print("⚠️ Некорректный выбор. Пожалуйста, введите 1 или 2.")
-                print("Выберите режим настройки (1 или 2): ", end='', flush=True)
-                
-        # Небольшая пауза, чтобы не загружать ЦП в ожидании нажатия
-        time.sleep(0.05) 
+        key = getch()
+        if key == b'1':
+            print("1")
+            return None
+        if key == b'2':
+            print("2")
+            return DEFAULT_SETTINGS
+        if key == b'\x03':
+            raise KeyboardInterrupt
+        print("⚠️ Некорректный выбор. Пожалуйста, введите 1 или 2.")
+        print("Выберите режим настройки (1 или 2): ", end='', flush=True)
 
 def choose_option(prompt, options):
-    """Позволяет выбрать один из предложенных вариантов (мгновенный выбор по цифре в Windows)."""
+    """Позволяет выбрать один из предложенных вариантов."""
     print(f"\n{prompt}")
     num_options = len(options)
     for i, option in enumerate(options, start=1):
         print(f"  {i}. {option}")
 
     print("Выберите номер: ", end='', flush=True)
-
     while True:
-        if msvcrt and msvcrt.kbhit():
-            key = msvcrt.getch()
-            try:
-                digit = key.decode('ascii')
-                if '1' <= digit <= str(min(num_options, 9)): # Проверяем цифру от 1 до 9 (и не больше кол-ва опций)
-                    print(digit) # Отображаем выбор
-                    selected_index = int(digit) - 1
-                    return options[selected_index]
-                elif key == b'\x03': # Ctrl+C
-                    raise KeyboardInterrupt
-                # Игнорируем другие клавиши (включая цифры > num_options или 0)
-            except UnicodeDecodeError:
-                if key == b'\x03': # Ctrl+C
-                    raise KeyboardInterrupt
-                # Игнорируем не-ASCII клавиши
-                pass
-            except KeyboardInterrupt:
-                raise # Передаем исключение выше
-                
-        elif not msvcrt:
-            # Fallback на стандартный input для не-Windows систем
-            try:
-                choice_str = input() # Читаем ввод пользователя
-                selected_index = int(choice_str) - 1
-                if 0 <= selected_index < num_options:
-                    return options[selected_index]
-                else:
-                    print("⚠️ Ошибка: выберите корректный номер!")
-                    print("Выберите номер: ", end='', flush=True)
-            except ValueError:
-                print("⚠️ Ошибка: введите число!")
-                print("Выберите номер: ", end='', flush=True)
-            except KeyboardInterrupt:
-                raise
-
-        # Небольшая пауза
-        time.sleep(0.05)
+        try:
+            key = getch()
+            digit = key.decode('ascii')
+            selected_index = int(digit) - 1
+            if 0 <= selected_index < num_options:
+                print(digit)
+                return options[selected_index]
+            print("⚠️ Ошибка: выберите корректный номер!")
+            print("Выберите номер: ", end='', flush=True)
+        except ValueError:
+            print("⚠️ Ошибка: введите число!")
+            print("Выберите номер: ", end='', flush=True)
+        except UnicodeDecodeError:
+            if key == b'\x03':
+                raise KeyboardInterrupt
+            # Игнорируем не-ASCII клавиши
+            continue
 
 def full_port_configuration():
     """Полная ручная настройка порта"""
@@ -323,33 +639,61 @@ def full_port_configuration():
         "stopbits": stopbits
     }
 
-def read_line_msvcrt(prompt=""):
-    """Читает строку ввода посимвольно с использованием msvcrt (только Windows).
+def read_line_msvcrt(prompt="", history_key: str | None = None):
+    """Читает строку ввода посимвольно (кроссплатформенно).
     
     Поддерживает Backspace, завершает ввод по Enter.
     Возвращает None при нажатии Esc, пустую строку при Ctrl+C.
     """
-    if not msvcrt:
+    # На Unix/macOS в некоторых терминалах (особенно при запуске из .app)
+    # посимвольный raw-ввод может вести себя нестабильно.
+    # Для надежности используем обычный построчный input().
+    if os.name != 'nt':
+        old_completer = None
+        old_delims = None
+        display_hook_supported = hasattr(readline, "set_completion_display_matches_hook")
+        if READLINE_AVAILABLE:
+            if history_key in HISTORY_KEYS:
+                apply_readline_history(history_key)
+            old_completer = readline.get_completer()
+            old_delims = readline.get_completer_delims()
+            readline.set_completer_delims(" \t\n")
+            # На macOS часто используется libedit (не GNU readline).
+            # Для него нужен другой синтаксис бинда Tab.
+            if "libedit" in (getattr(readline, "__doc__", "") or "").lower():
+                readline.parse_and_bind("bind ^I rl_complete")
+            else:
+                readline.parse_and_bind("tab: complete")
+            readline.set_completer(make_readline_completer(history_key))
+            if display_hook_supported:
+                readline.set_completion_display_matches_hook(make_readline_display_hook(prompt))
         try:
-            # Возврат к стандартному input, если msvcrt недоступен
-            return input(prompt)
-        except KeyboardInterrupt:
-            print("\nОперация прервана.")
-            return "" # Возвращаем пустую строку при прерывании в input
+            user_input = input(prompt)
+        finally:
+            if READLINE_AVAILABLE:
+                readline.set_completer(old_completer)
+                if old_delims is not None:
+                    readline.set_completer_delims(old_delims)
+                if display_hook_supported:
+                    readline.set_completion_display_matches_hook(None)
+        # Аналог "Esc" для line-input режима.
+        if user_input.strip().lower() in {"esc", "/esc", "/menu", "/back"}:
+            return None
+        return user_input
         
     print(prompt, end='', flush=True)
     chars = []
     while True:
         try:
-            key = msvcrt.getch()
+            key = getch()
             
-            if key == b'\r': # Enter
+            if key == b'\r' or key == b'\n': # Enter (Windows \r, Unix \n)
                 print() # Перевод строки после ввода
                 break
             elif key == b'\x1b': # Esc
                 print(" [Esc]") # Показываем, что нажали Esc
                 return None # Возвращаем None для выхода из цикла
-            elif key == b'\x08': # Backspace
+            elif key == b'\x08' or key == b'\x7f': # Backspace (Windows \x08, Unix \x7f)
                 if chars:
                     chars.pop()
                     # Стереть символ с консоли: \b (назад) + ' ' (пробел) + \b (назад)
@@ -376,41 +720,145 @@ def read_line_msvcrt(prompt=""):
             
     return "".join(chars)
 
-def handle_send_text_loop(ser):
+
+def ensure_receive_active(processing_event):
+    """Гарантирует, что прием включен перед режимами отправки."""
+    if not processing_event.is_set():
+        processing_event.set()
+        print("ℹ️ Прием данных был остановлен и автоматически возобновлен.")
+
+def handle_send_text_loop(ser, settings, receiver_thread, processing_event):
     """Цикл для непрерывной отправки текстовых сообщений."""
     print() # Добавляем пустую строку
-    print("\n--- Режим отправки текста (Esc для возврата в меню) ---")
+    ensure_receive_active(processing_event)
+    print("\n--- Режим отправки текста (Esc для возврата в меню; help/init/doctor/history) ---")
     while True:
-        message = read_line_msvcrt(prompt="Введите текст: ")
+        message = read_line_msvcrt(prompt="Введите текст: ", history_key="text")
         if message is None: # Нажат Esc в read_line_msvcrt
             break
         if message and ser.is_open: # Отправляем только если не пустая строка
-            send_text_message(ser, message)
+            if handle_runtime_command(message, ser, settings, receiver_thread, processing_event, "text"):
+                continue
+            if send_text_message(ser, message):
+                add_command_to_history("text", message)
 
-def handle_send_hex_loop(ser):
+def print_runtime_commands_help():
+    """Показывает служебные команды, доступные в режимах отправки."""
+    print("\n=== 🆘 Служебные команды ===")
+    print("  help   - Показать эту справку")
+    print("  init   - Показать текущие параметры порта/сессии")
+    print("  doctor - Диагностика состояния соединения и потока приема")
+    print("  history- Показать историю команд текущего режима")
+    print("  esc    - Возврат в меню (также /esc, /menu, /back)")
+    print("  Tab    - Автодополнение команд")
+
+
+def print_init_info(ser, settings):
+    """Показывает краткую сводку текущей инициализации порта."""
+    print("\n=== ⚙️ Init / Текущая сессия ===")
+    print(f"Порт: {ser.port}")
+    print(f"Скорость: {settings['baudrate']} бод")
+    print(f"Биты данных: {settings['bytesize']}")
+    print(f"Паритет: {settings['parity']}")
+    print(f"Стоп-биты: {settings['stopbits']}")
+    print(f"timeout: {ser.timeout}")
+    print(f"inter_byte_timeout: {ser.inter_byte_timeout}")
+    print(f"Файл истории: {HISTORY_FILE}")
+
+
+def run_doctor(ser, receiver_thread, processing_event):
+    """Диагностика текущего состояния соединения."""
+    print("\n=== 🩺 Doctor ===")
+    print(f"Порт открыт: {'да' if ser.is_open else 'нет'}")
+    print(f"Порт доступен в системе: {'да' if is_port_currently_available(ser.port) else 'нет'}")
+    print(f"Поток приема жив: {'да' if receiver_thread and receiver_thread.is_alive() else 'нет'}")
+    print(f"Прием разрешен: {'да' if processing_event.is_set() else 'нет'}")
+    try:
+        print(f"in_waiting: {ser.in_waiting}")
+    except Exception as e:
+        print(f"in_waiting: ошибка ({e})")
+    try:
+        print(f"out_waiting: {ser.out_waiting}")
+    except Exception as e:
+        print(f"out_waiting: ошибка ({e})")
+    print("Doctor: OK")
+
+
+def handle_runtime_command(
+    raw_value: str,
+    ser,
+    settings,
+    receiver_thread,
+    processing_event,
+    history_key: str | None = None,
+) -> bool:
+    """Обрабатывает служебные команды в режимах отправки.
+    Возвращает True, если команда обработана и отправка не нужна.
+    """
+    command = raw_value.strip().lower()
+    aliases = {
+        "/help": "help",
+        "/init": "init",
+        "/doctor": "doctor",
+        "/history": "history",
+    }
+    command = aliases.get(command, command)
+
+    # Надежный fallback: автодополнение по уникальному префиксу на Enter.
+    # Пример: "do" -> "doctor", "his" -> "history".
+    known_commands = ("help", "init", "doctor", "history")
+    if command not in known_commands:
+        prefix_matches = [cmd for cmd in known_commands if cmd.startswith(command)]
+        if len(prefix_matches) == 1:
+            command = prefix_matches[0]
+
+    if command == "help":
+        print_runtime_commands_help()
+        return True
+    if command == "init":
+        print_init_info(ser, settings)
+        return True
+    if command == "doctor":
+        run_doctor(ser, receiver_thread, processing_event)
+        return True
+    if command == "history":
+        show_history_entries(history_key)
+        return True
+    return False
+
+
+def handle_send_hex_loop(ser, settings, receiver_thread, processing_event):
     """Цикл для непрерывной отправки HEX данных."""
     print() # Добавляем пустую строку
-    print("\n--- Режим отправки HEX (Esc для возврата в меню) ---")
+    ensure_receive_active(processing_event)
+    print("\n--- Режим отправки HEX (Esc для возврата в меню; help/init/doctor/history) ---")
     while True:
-        hex_data = read_line_msvcrt(prompt="Введите HEX: ")
+        hex_data = read_line_msvcrt(prompt="Введите HEX: ", history_key="hex")
         if hex_data is None: # Нажат Esc
             break
         if hex_data and ser.is_open:
-            send_hex_data(ser, hex_data)
+            if handle_runtime_command(hex_data, ser, settings, receiver_thread, processing_event, "hex"):
+                continue
+            if send_hex_data(ser, hex_data):
+                add_command_to_history("hex", hex_data)
 
-def handle_send_hex_crc_loop(ser):
+def handle_send_hex_crc_loop(ser, settings, receiver_thread, processing_event):
     """Цикл для непрерывной отправки HEX данных с CRC."""
     print() # Добавляем пустую строку
-    print("\n--- Режим отправки HEX+CRC (Esc для возврата в меню) ---")
+    ensure_receive_active(processing_event)
+    print("\n--- Режим отправки HEX+CRC (Esc для возврата в меню; help/init/doctor/history) ---")
     while True:
-        hex_data = read_line_msvcrt(prompt="Введите HEX для CRC: ")
+        hex_data = read_line_msvcrt(prompt="Введите HEX для CRC: ", history_key="hex_crc")
         if hex_data is None: # Нажат Esc
             break
         if hex_data and ser.is_open:
-            send_hex_data_with_crc(ser, hex_data)
+            if handle_runtime_command(hex_data, ser, settings, receiver_thread, processing_event, "hex_crc"):
+                continue
+            if send_hex_data_with_crc(ser, hex_data):
+                add_command_to_history("hex_crc", hex_data)
 
 def process_request(request):
-    """Логика обработки запросов."""
+    """Логика обработки входящих данных и автогенерации ответа."""
     if request == bytes([0x01, 0x02, 0x03]):
         return bytes([0x01, 0x0C])
     elif request == bytes([0x41]):
@@ -419,12 +867,15 @@ def process_request(request):
         return bytes([0xDD, 0xEE])
     elif len(request) == 3 and request[0] == 0x01:
         return bytes([request[0], request[1] + 10])
+
     return None
 
 def main():
-    # Проверка, доступен ли msvcrt (только Windows)
-    if not msvcrt:
-        print("❌ Ошибка: Мгновенное чтение клавиш поддерживается только в Windows.")
+    print(f"VirtualCom v{__version__} (релиз: {__release_date__})")
+
+    # Проверка на наличие функций ввода (должны быть определены для всех ОС)
+    if not getch or not kbhit:
+        print("❌ Ошибка: Функции ввода не инициализированы.")
         sys.exit(1)
 
     while True:  # Цикл для повторного выбора порта
@@ -501,7 +952,7 @@ def main():
                 continue
 
             print(f"\n✅ Соединение установлено: Порт 📌: {ser.port} @ {ser.baudrate} бод @ {ser.bytesize} @ {ser.parity} @ {ser.stopbits}")
-            print("\n🔄 Эмулятор готов к работе.")
+            print("\n🔄 VirtualCom готов к работе.")
 
             # Устанавливаем событие - прием разрешен по умолчанию
             processing_event.set()
@@ -519,74 +970,104 @@ def main():
                 show_menu(status_message=initial_status)
                 
                 while True:
-                    if msvcrt.kbhit():
-                        key = msvcrt.getch()
-                        
-                        current_status_message = None # Сбрасываем статус перед обработкой
+                    key = None
+                    choice = None
 
+                    if os.name == 'nt':
+                        if not kbhit():
+                            # Проверяем, жив ли еще поток (на случай ошибки в нем)
+                            if receiver_thread and not receiver_thread.is_alive():
+                                print("\n⚠️ Поток приема данных неожиданно завершился.")
+                                break
+                            time.sleep(0.05)
+                            continue
+
+                        key = getch()
                         if key == b'\x03': # Ctrl+C
                             raise KeyboardInterrupt
-                        elif key == b'\x1b': # Esc
-                            processing_event.clear() # Останавливаем прием
-                            os.system('cls' if os.name == 'nt' else 'clear')
-                            current_status_message = "⏸ Прием команд остановлен."
-                            # show_menu(status_message="⏸ Прием команд остановлен.") # Вызов show_menu будет ниже
-                            # continue # Убираем continue, чтобы show_menu вызвался один раз
-                        
+                        try:
+                            choice = key.decode('ascii')
+                        except UnicodeDecodeError:
+                            choice = None
+                    else:
+                        # На macOS/Linux читаем меню мгновенно по одной клавише.
+                        key = getch()
+                        if key == b'\x03':
+                            raise KeyboardInterrupt
+                        # ANSI-стрелки начинаются с ESC-последовательности.
+                        # Не воспринимаем их как "Esc в меню".
+                        if key == b'\x1b':
+                            time.sleep(0.01)
+                            consumed_escape_sequence = False
+                            while kbhit():
+                                _ = getch()
+                                consumed_escape_sequence = True
+                            if consumed_escape_sequence:
+                                # Игнорируем стрелки/ANSI-последовательности в главном меню.
+                                continue
                         try:
                             choice = key.decode('ascii')
                         except UnicodeDecodeError:
                             choice = None
 
-                        # Флаг, нужно ли перерисовать меню после действия
-                        redisplay_menu = False
+                    current_status_message = None # Сбрасываем статус перед обработкой
 
-                        if choice == '1':
-                            handle_send_text_loop(ser)
-                            redisplay_menu = True
-                        elif choice == '2':
-                            handle_send_hex_loop(ser)
-                            redisplay_menu = True
-                        elif choice == '3':
-                            handle_send_hex_crc_loop(ser)
-                            redisplay_menu = True
-                        elif choice == '4': # Остановить прием
-                            processing_event.clear()
-                            current_status_message = "⏸ Прием команд остановлен."
-                            redisplay_menu = True
-                        elif choice == '5': # Продолжить прием
-                            processing_event.set() 
-                            if ser.is_open:
-                                try:
-                                    ser.reset_input_buffer() # Очищаем буфер приема
-                                    current_status_message = "▶️ Прием команд возобновлен (буфер очищен)."
-                                except Exception as e:
-                                    print(f"\n⚠️ Ошибка при очистке буфера: {e}")
-                                    current_status_message = "▶️ Прием команд возобновлен (ошибка очистки буфера)."
-                            else:
-                                current_status_message = "▶️ Прием команд возобновлен (порт закрыт?)."
-                            redisplay_menu = True
-                        elif choice == '6': # Очистить экран
-                            os.system('cls' if os.name == 'nt' else 'clear')
-                            # Статус нужно определить заново, так как экран очищен
-                            current_status_message = "▶️ Прием команд активен." if processing_event.is_set() else "⏸ Прием команд остановлен."
-                            redisplay_menu = True
-                        elif choice == '7': # Выход
-                            print("\n👋 До свидания!")
-                            break # Выход из внутреннего цикла
+                    if key == b'\x1b': # Esc
+                        processing_event.clear() # Останавливаем прием
+                        os.system('cls' if os.name == 'nt' else 'clear')
+                        current_status_message = "⏸ Прием команд остановлен."
+
+                    # Флаг, нужно ли перерисовать меню после действия
+                    redisplay_menu = False
+
+                    if choice == '1':
+                        handle_send_text_loop(ser, settings, receiver_thread, processing_event)
+                        redisplay_menu = True
+                    elif choice == '2':
+                        handle_send_hex_loop(ser, settings, receiver_thread, processing_event)
+                        redisplay_menu = True
+                    elif choice == '3':
+                        handle_send_hex_crc_loop(ser, settings, receiver_thread, processing_event)
+                        redisplay_menu = True
+                    elif choice == '4': # Остановить прием
+                        processing_event.clear()
+                        current_status_message = "⏸ Прием команд остановлен."
+                        redisplay_menu = True
+                    elif choice == '5': # Продолжить прием
+                        processing_event.set() 
+                        if ser.is_open:
+                            try:
+                                ser.reset_input_buffer() # Очищаем буфер приема
+                                current_status_message = "▶️ Прием команд возобновлен (буфер очищен)."
+                            except Exception as e:
+                                print(f"\n⚠️ Ошибка при очистке буфера: {e}")
+                                current_status_message = "▶️ Прием команд возобновлен (ошибка очистки буфера)."
                         else:
-                            # Если нажата не цифра и не спец. клавиша, но это был Esc
-                            if key == b'\x1b': 
-                                redisplay_menu = True # Нужно перерисовать меню со статусом
-                            # Иначе игнорируем
-                            pass 
+                            current_status_message = "▶️ Прием команд возобновлен (порт закрыт?)."
+                        redisplay_menu = True
+                    elif choice == '6': # Очистить экран
+                        os.system('cls' if os.name == 'nt' else 'clear')
+                        # Статус нужно определить заново, так как экран очищен
+                        current_status_message = "▶️ Прием команд активен." if processing_event.is_set() else "⏸ Прием команд остановлен."
+                        redisplay_menu = True
+                    elif choice == '7': # Выход
+                        print("\n👋 До свидания!")
+                        break # Выход из внутреннего цикла
+                    elif choice == '8': # История команд
+                        manage_command_history()
+                        current_status_message = "🕘 История команд обновлена."
+                        redisplay_menu = True
+                    else:
+                        # Если введен Esc как команда в line-mode
+                        if key == b'\x1b': 
+                            redisplay_menu = True # Нужно перерисовать меню со статусом
 
-                        # Перерисовываем меню, если нужно (после действия или Esc)
-                        if redisplay_menu:
-                            # Определяем статус, если он еще не определен (например, после ввода данных)
-                            if not current_status_message:
-                                current_status_message = "▶️ Прием команд активен." if processing_event.is_set() else "⏸ Прием команд остановлен."
-                            show_menu(status_message=current_status_message)
+                    # Перерисовываем меню, если нужно (после действия или Esc)
+                    if redisplay_menu:
+                        # Определяем статус, если он еще не определен (например, после ввода данных)
+                        if not current_status_message:
+                            current_status_message = "▶️ Прием команд активен." if processing_event.is_set() else "⏸ Прием команд остановлен."
+                        show_menu(status_message=current_status_message)
 
                     # Проверяем, жив ли еще поток (на случай ошибки в нем)
                     if receiver_thread and not receiver_thread.is_alive():
@@ -600,12 +1081,10 @@ def main():
             finally:
                 # Сначала останавливаем прием, чтобы поток мог завершиться
                 processing_event.set() # Устанавливаем на случай, если был clear
-                if ser and ser.is_open:
-                    ser.close()
-                    print(f"\n🔌 Порт {port} закрыт.")
-                    # Даем потоку шанс завершиться после закрытия порта
-                    if receiver_thread and receiver_thread.is_alive():
-                        receiver_thread.join(timeout=1.0)
+                safe_close_serial(ser, port)
+                # Даем потоку шанс завершиться после закрытия порта
+                if receiver_thread and receiver_thread.is_alive():
+                    receiver_thread.join(timeout=1.0)
                 
                 # Повторная проверка и сообщение, если поток все еще жив
                 if receiver_thread and receiver_thread.is_alive():
@@ -617,13 +1096,13 @@ def main():
             print("\n🚪 Завершение работы по Ctrl + C")
             # Убеждаемся, что событие установлено перед выходом, чтобы поток не завис на wait
             if 'processing_event' in locals(): processing_event.set() 
-            if ser and ser.is_open: ser.close()
+            safe_close_serial(ser)
             sys.exit(0)
         except Exception as e:
             print(f"\n❌ Неожиданная ошибка: {e}")
             # Убеждаемся, что событие установлено перед выходом/повтором
             if 'processing_event' in locals(): processing_event.set()
-            if ser and ser.is_open: ser.close()
+            safe_close_serial(ser)
             retry = input("\nПопробовать снова? (y/n): ").lower().strip()
             if retry != 'y':
                 sys.exit(1)
