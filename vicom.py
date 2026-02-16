@@ -683,10 +683,13 @@ def read_line_msvcrt(prompt="", history_key: str | None = None):
         
     print(prompt, end='', flush=True)
     chars = []
+    history_index = -1  # -1 = новая команда, 0+ = индекс в истории
+    current_history = COMMAND_HISTORY.get(history_key, []) if history_key in HISTORY_KEYS else []
+
     while True:
         try:
             key = getch()
-            
+
             if key == b'\r' or key == b'\n': # Enter (Windows \r, Unix \n)
                 print() # Перевод строки после ввода
                 break
@@ -698,10 +701,68 @@ def read_line_msvcrt(prompt="", history_key: str | None = None):
                     chars.pop()
                     # Стереть символ с консоли: \b (назад) + ' ' (пробел) + \b (назад)
                     print('\b \b', end='', flush=True)
+                    history_index = -1  # Сброс при ручном редактировании
+            elif key == b'\t':  # Tab - автодополнение
+                current_text = "".join(chars).lower()
+                # Кандидаты: служебные команды + история текущего режима
+                candidates = list(RUNTIME_COMMANDS)
+                if history_key in HISTORY_KEYS:
+                    candidates.extend(COMMAND_HISTORY.get(history_key, []))
+                # Удаляем дубликаты и сортируем
+                candidates = sorted(set(candidates), key=str.lower)
+                # Ищем совпадения
+                matches = [c for c in candidates if c.lower().startswith(current_text)]
+
+                if len(matches) == 1:
+                    # Одно совпадение - автодополняем
+                    print('\r' + ' ' * (len(prompt) + len(chars)), end='', flush=True)
+                    chars = list(matches[0])
+                    print(f'\r{prompt}{"".join(chars)}', end='', flush=True)
+                    history_index = -1
+                elif len(matches) > 1:
+                    # Несколько совпадений - показываем список
+                    print()
+                    for match in matches:
+                        key_name = match.lstrip("/")
+                        hint = RUNTIME_COMMAND_HELP.get(key_name)
+                        if hint:
+                            print(f"  {match:<12} - {hint}")
+                        else:
+                            print(f"  {match}")
+                    print(f'{prompt}{"".join(chars)}', end='', flush=True)
             elif key == b'\x03': # Ctrl+C
                  # Не прерываем здесь, чтобы позволить основному циклу обработать
                  print(" [Ctrl+C]")
-                 raise KeyboardInterrupt 
+                 raise KeyboardInterrupt
+            elif key == b'\x00' or key == b'\xe0':  # Специальные клавиши на Windows (стрелки, F-клавиши и т.д.)
+                if kbhit():  # Проверяем наличие второго байта
+                    arrow_key = getch()
+                    if arrow_key == b'H' and current_history:  # Стрелка вверх
+                        # Перемещаемся назад по истории
+                        if history_index == -1:
+                            history_index = len(current_history) - 1
+                        elif history_index > 0:
+                            history_index -= 1
+
+                        # Очищаем текущую строку и выводим команду из истории
+                        print('\r' + ' ' * (len(prompt) + len(chars)), end='', flush=True)
+                        chars = list(current_history[history_index])
+                        print(f'\r{prompt}{"".join(chars)}', end='', flush=True)
+
+                    elif arrow_key == b'P' and current_history:  # Стрелка вниз
+                        # Перемещаемся вперед по истории
+                        if history_index >= 0 and history_index < len(current_history) - 1:
+                            history_index += 1
+                            # Очищаем строку и выводим следующую команду
+                            print('\r' + ' ' * (len(prompt) + len(chars)), end='', flush=True)
+                            chars = list(current_history[history_index])
+                            print(f'\r{prompt}{"".join(chars)}', end='', flush=True)
+                        elif history_index >= 0:
+                            # Возвращаемся к пустому вводу
+                            history_index = -1
+                            print('\r' + ' ' * (len(prompt) + len(chars)), end='', flush=True)
+                            chars = []
+                            print(f'\r{prompt}', end='', flush=True)
             else:
                 try:
                     char = key.decode('cp866') # Попробуем OEM кодировку Windows
@@ -709,15 +770,16 @@ def read_line_msvcrt(prompt="", history_key: str | None = None):
                     if char.isprintable(): # Печатаем только видимые символы
                          chars.append(char)
                          print(char, end='', flush=True)
+                         history_index = -1  # Сброс индекса при ручном вводе
                 except UnicodeDecodeError:
                     # Игнорируем байты, которые не можем декодировать
-                    pass 
-                    
+                    pass
+
         except KeyboardInterrupt:
             # Эта обработка нужна, если Ctrl+C нажат во время работы getch()?
             # Лучше передать выше
             raise KeyboardInterrupt
-            
+
     return "".join(chars)
 
 
